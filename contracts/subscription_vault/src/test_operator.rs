@@ -35,6 +35,24 @@ fn make_funded_subscription(te: &TestEnv, subscriber: &Address, merchant: &Addre
     sub_id
 }
 
+fn make_funded_usage_subscription(te: &TestEnv, subscriber: &Address, merchant: &Address) -> u32 {
+    let sub_id = te.client.create_subscription(
+        subscriber,
+        merchant,
+        &AMOUNT,
+        &INTERVAL,
+        &true,
+        &None,
+        &None::<u64>,
+        &None::<u32>,
+        &None::<soroban_sdk::Symbol>,
+    );
+    te.stellar_token_client().mint(subscriber, &DEPOSIT);
+    te.client
+        .deposit_funds(&sub_id, subscriber, &DEPOSIT, &None::<soroban_sdk::BytesN<32>>);
+    sub_id
+}
+
 // ── set_operator ─────────────────────────────────────────────────────────────
 
 #[test]
@@ -755,6 +773,97 @@ fn operator_charge_usage_with_reference_succeeds() {
 
     let sub = te.client.get_subscription(&sub_id);
     assert_eq!(sub.prepaid_balance, DEPOSIT - usage);
+}
+
+#[test]
+fn operator_charge_usage_with_reference_rejects_unauthorized_operator() {
+    let te = TestEnv::default();
+    let subscriber = Address::generate(&te.env);
+    let merchant = Address::generate(&te.env);
+    let operator = Address::generate(&te.env);
+    let stranger = Address::generate(&te.env);
+    let sub_id = make_funded_usage_subscription(&te, &subscriber, &merchant);
+    te.client.set_operator(&te.admin, &operator);
+    let before = te.client.get_subscription(&sub_id);
+
+    let result = te.client.try_operator_charge_usage_with_ref(
+        &stranger,
+        &sub_id,
+        &1_000_000i128,
+        &soroban_sdk::String::from_str(&te.env, "unauthorized"),
+    );
+
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+    assert_eq!(te.client.get_subscription(&sub_id), before);
+}
+
+#[test]
+fn operator_charge_usage_with_reference_rejects_invalid_and_insufficient_amounts() {
+    let te = TestEnv::default();
+    let subscriber = Address::generate(&te.env);
+    let merchant = Address::generate(&te.env);
+    let operator = Address::generate(&te.env);
+    let sub_id = make_funded_usage_subscription(&te, &subscriber, &merchant);
+    te.client.set_operator(&te.admin, &operator);
+
+    for (usage, expected_error, reference) in [
+        (0i128, Error::InvalidAmount, "zero"),
+        (-1i128, Error::InvalidAmount, "negative"),
+        (DEPOSIT + 1, Error::InsufficientPrepaidBalance, "insufficient"),
+    ] {
+        let before = te.client.get_subscription(&sub_id);
+        let result = te.client.try_operator_charge_usage_with_ref(
+            &operator,
+            &sub_id,
+            &usage,
+            &soroban_sdk::String::from_str(&te.env, reference),
+        );
+
+        assert_eq!(result, Err(Ok(expected_error)));
+        assert_eq!(te.client.get_subscription(&sub_id), before);
+    }
+}
+
+#[test]
+fn operator_charge_usage_with_reference_rejects_unknown_subscription() {
+    let te = TestEnv::default();
+    let operator = Address::generate(&te.env);
+    te.client.set_operator(&te.admin, &operator);
+
+    let result = te.client.try_operator_charge_usage_with_ref(
+        &operator,
+        &u32::MAX,
+        &1i128,
+        &soroban_sdk::String::from_str(&te.env, "unknown"),
+    );
+
+    assert_eq!(result, Err(Ok(Error::NotFound)));
+}
+
+#[test]
+fn operator_charge_usage_with_reference_replay_does_not_debit_again() {
+    let te = TestEnv::default();
+    let subscriber = Address::generate(&te.env);
+    let merchant = Address::generate(&te.env);
+    let operator = Address::generate(&te.env);
+    let sub_id = make_funded_usage_subscription(&te, &subscriber, &merchant);
+    te.client.set_operator(&te.admin, &operator);
+    let reference = soroban_sdk::String::from_str(&te.env, "replay");
+    let usage = 500_000i128;
+
+    assert_eq!(
+        te.client
+            .operator_charge_usage_with_ref(&operator, &sub_id, &usage, &reference),
+        crate::UsageChargeResult::Charged
+    );
+    let after_first_charge = te.client.get_subscription(&sub_id);
+
+    assert_eq!(
+        te.client
+            .operator_charge_usage_with_ref(&operator, &sub_id, &usage, &reference),
+        crate::UsageChargeResult::Replay
+    );
+    assert_eq!(te.client.get_subscription(&sub_id), after_first_charge);
 }
 
 // ── Subscription state integrity ──────────────────────────────────────────────
